@@ -633,6 +633,9 @@ dispatchDial (Parcel &p, RequestInfo *pRI) {
     int32_t sizeOfDial;
     int32_t t;
     int32_t uusPresent;
+#ifdef MODEM_TYPE_XMM7260
+    char *csv;
+#endif
     status_t status;
 
     memset (&dial, 0, sizeof(dial));
@@ -645,6 +648,25 @@ dispatchDial (Parcel &p, RequestInfo *pRI) {
     if (status != NO_ERROR || dial.address == NULL) {
         goto invalid;
     }
+
+#ifdef MODEM_TYPE_XMM7260
+    /* CallDetails.call_type */
+    status = p.readInt32(&t);
+    if (status != NO_ERROR) {
+        goto invalid;
+    }
+    /* CallDetails.call_domain */
+    p.readInt32(&t);
+    if (status != NO_ERROR) {
+        goto invalid;
+    }
+    /* CallDetails.getCsvFromExtra */
+    csv = strdupReadString(p);
+    if (csv == NULL) {
+        goto invalid;
+    }
+    free(csv);
+#endif
 
     if (s_callbacks.version < 3) { // Remove when partners upgrade to version 3
         uusPresent = 0;
@@ -1062,7 +1084,6 @@ dispatchImsGsmSms(Parcel &p, RequestInfo *pRI, uint8_t retry, int32_t messageRef
     rism.messageRef = messageRef;
 
     startRequest;
-    appendPrintBuf("%sformat=%d,", printBuf, rism.format);
     if (countStrings == 0) {
         // just some non-null pointer
         pStrings = (char **)alloca(sizeof(char *));
@@ -1507,7 +1528,7 @@ static void dispatchSetInitialAttachApn(Parcel &p, RequestInfo *pRI)
 
     startRequest;
     appendPrintBuf("%sapn=%s, protocol=%s, auth_type=%d, username=%s, password=%s",
-            printBuf, pf.apn, pf.protocol, pf.auth_type, pf.username, pf.password);
+            printBuf, pf.apn, pf.protocol, pf.authtype, pf.username, pf.password);
     closeRequest;
     printRequest(pRI->token, pRI->pCI->requestNumber);
 
@@ -1817,6 +1838,16 @@ static int responseCallList(Parcel &p, void *response, size_t responselen) {
         p.writeInt32(p_cur->isMT);
         p.writeInt32(p_cur->als);
         p.writeInt32(p_cur->isVoice);
+
+#ifdef MODEM_TYPE_XMM7260
+        p.writeInt32(p_cur->isVideo);
+
+        /* Pass CallDetails */
+        p.writeInt32(0);
+        p.writeInt32(0);
+        writeStringToParcel(p, "");
+#endif
+
         p.writeInt32(p_cur->isVoicePrivacy);
         writeStringToParcel(p, p_cur->number);
         p.writeInt32(p_cur->numberPresentation);
@@ -1845,7 +1876,12 @@ static int responseCallList(Parcel &p, void *response, size_t responselen) {
             p_cur->als,
             (p_cur->isVoice)?"voc":"nonvoc",
             (p_cur->isVoicePrivacy)?"evp":"noevp");
-        appendPrintBuf("%s%s,cli=%d,name='%s',%d]",
+#ifdef MODEM_TYPE_XMM7260
+        appendPrintBuf("%s,%s,",
+                printBuf,
+                (p_cur->isVideo) ? "vid" : "novid");
+#endif
+        appendPrintBuf("%snumber='%s',cli=%d,name='%s',%d]",
             printBuf,
             p_cur->number,
             p_cur->numberPresentation,

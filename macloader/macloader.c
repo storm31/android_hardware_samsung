@@ -16,15 +16,27 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "macloader"
+#define LOG_NDEBUG 0
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pwd.h>
+
 #include <cutils/log.h>
 
-#define LOG_TAG "macloader"
-#define LOG_NDEBUG 0
+#ifndef WIFI_DRIVER_NVRAM_PATH
+#define WIFI_DRIVER_NVRAM_PATH		NULL
+#endif
+
+#ifndef WIFI_DRIVER_NVRAM_PATH_PARAM
+#define WIFI_DRIVER_NVRAM_PATH_PARAM "/sys/module/wlan/parameters/nvram_path"
+#endif
 
 #define MACADDR_PATH "/efs/wifi/.mac.info"
 #define CID_PATH "/data/.cid.info"
@@ -37,6 +49,82 @@ enum Type {
     SEMCO3RD,
     WISOL
 };
+
+static int wifi_change_nvram_calibration(const char *nvram_file,
+                                         const char *type)
+{
+    int len;
+    int fd = -1;
+    int ret = 0;
+    struct stat sb;
+    char nvram_str[1024] = { 0 };
+
+    if (nvram_file == NULL || type == NULL) {
+        return -1;
+    }
+
+    ret = stat(nvram_file, &sb);
+    if (ret != 0) {
+        ALOGE("Failed to check for NVRAM calibration file '%s' - error: %s",
+              nvram_file,
+              strerror(errno));
+        return -1;
+    }
+
+    ALOGD("Using NVRAM calibration file: %s\n", nvram_file);
+
+    fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_NVRAM_PATH_PARAM, O_WRONLY));
+    if (fd < 0) {
+        ALOGE("Failed to open wifi nvram config path %s - error: %s",
+              WIFI_DRIVER_NVRAM_PATH_PARAM, strerror(errno));
+        return -1;
+    }
+
+    len = strlen(nvram_file) + 1;
+    if (TEMP_FAILURE_RETRY(write(fd, nvram_file, len)) != len) {
+        ALOGE("Failed to write to wifi config path %s - error: %s",
+              WIFI_DRIVER_NVRAM_PATH_PARAM, strerror(errno));
+        ret = -1;
+        goto out;
+    }
+
+    snprintf(nvram_str, sizeof(nvram_str), "%s_%s",
+             nvram_file, type);
+
+    ALOGD("Changing NVRAM calibration file for %s chipset\n", type);
+
+    ret = stat(nvram_str, &sb);
+    if (ret != 0) {
+        ALOGW("NVRAM calibration file '%s' doesn't exist", nvram_str);
+        /*
+         * We were able to write the default calibration file. So
+         * continue here without returning an error.
+         */
+        ret = 0;
+        goto out;
+    }
+
+    len = strlen(nvram_str) + 1;
+    if (TEMP_FAILURE_RETRY(write(fd, nvram_str, len)) != len) {
+        ALOGW("Failed to write to wifi config path %s - error: %s",
+              WIFI_DRIVER_NVRAM_PATH_PARAM, strerror(errno));
+        /*
+         * We were able to write the default calibration file. So
+         * continue here without returning an error.
+         */
+        ret = 0;
+        goto out;
+    }
+
+    ALOGD("NVRAM calibration file set to '%s'\n", nvram_str);
+
+    ret = 0;
+out:
+    if (fd != -1) {
+        close(fd);
+    }
+    return ret;
+}
 
 int main() {
     FILE* file;
@@ -57,6 +145,7 @@ int main() {
 
     /* get and compare mac addr */
     str = fgets(mac_addr_half, 9, file);
+    fclose(file);
     if (str == 0) {
         fprintf(stderr, "fgets() from file %s failed\n", MACADDR_PATH);
         ALOGE("Can't read from %s\n", MACADDR_PATH);
@@ -105,6 +194,11 @@ int main() {
     }
 
     if (type != NONE) {
+        const char *nvram_file;
+        const char *type_str;
+        struct passwd *pwd;
+        int fd;
+
         /* open cid file */
         cidfile = fopen(CID_PATH, "w");
         if(cidfile == 0) {
@@ -116,62 +210,71 @@ int main() {
         switch(type) {
             case NONE:
                 return -1;
-            break;
             case MURATA:
-                /* write murata to cid file */
-                ALOGI("Writing murata to %s\n", CID_PATH);
-                ret = fputs("murata", cidfile);
-            break;
+                type_str = "murata";
+                break;
             case SEMCOSH:
-                /* write semcosh to cid file */
-                ALOGI("Writing semcosh to %s\n", CID_PATH);
-                ret = fputs("semcosh", cidfile);
-            break;
+                type_str = "semcosh";
+                break;
             case SEMCOVE:
-                /* write semcove to cid file */
-                ALOGI("Writing semcove to %s\n", CID_PATH);
-                ret = fputs("semcove", cidfile);
-            break;
+                type_str = "semcove";
+                break;
             case SEMCO3RD:
-                ALOGI("Writing semco3rd to %s\n", CID_PATH);
-                ret = fputs("semco3rd", cidfile);
-            break;
+                type_str = "semco3rd";
+                break;
             case WISOL:
-                ALOGI("Writing wisol to %s\n", CID_PATH);
-                ret = fputs("wisol", cidfile);
-            break;
-         }
+                type_str = "wisol";
+                break;
+        }
 
+        ALOGI("Settting wifi type to %s in %s\n", type_str, CID_PATH);
+
+        ret = fputs(type_str, cidfile);
         if (ret != 0) {
-            fprintf(stderr, "fputs() to file %s failed\n", CID_PATH);
             ALOGE("Can't write to %s\n", CID_PATH);
-            return -1;
+            return 1;
         }
-        fclose(cidfile);
 
-        /* set permissions on cid file */
-        ALOGD("Setting permissions on %s\n", CID_PATH);
+        /* Change permissions of cid file */
+        ALOGD("Change permissions of %s\n", CID_PATH);
+
+        fd = fileno(cidfile);
         amode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-        ret = chmod(CID_PATH, amode);
-
-        char* chown_cmd = (char*) malloc(strlen("chown system ") + strlen(CID_PATH) + 1);
-        char* chgrp_cmd = (char*) malloc(strlen("chgrp system ") + strlen(CID_PATH) + 1);
-        sprintf(chown_cmd, "chown system %s", CID_PATH);
-        sprintf(chgrp_cmd, "chgrp system %s", CID_PATH);
-        system(chown_cmd);
-        system(chgrp_cmd);
-
+        ret = fchmod(fd, amode);
         if (ret != 0) {
-            fprintf(stderr, "chmod() on file %s failed\n", CID_PATH);
-            ALOGE("Can't set permissions on %s\n", CID_PATH);
-            return ret;
+            fclose(cidfile);
+            ALOGE("Can't set permissions on %s - %s\n",
+                  CID_PATH, strerror(errno));
+            return 1;
         }
 
+        pwd = getpwnam("system");
+        if (pwd == NULL) {
+            fclose(cidfile);
+            ALOGE("Failed to find 'system' user - %s\n",
+                  strerror(errno));
+            return 1;
+        }
+
+        ret = fchown(fd, pwd->pw_uid, pwd->pw_gid);
+        fclose(cidfile);
+        if (ret != 0) {
+            ALOGE("Failed to change owner of %s - %s\n",
+                  CID_PATH, strerror(errno));
+            return 1;
+        }
+
+        nvram_file = WIFI_DRIVER_NVRAM_PATH;
+        if (nvram_file != NULL) {
+            ret = wifi_change_nvram_calibration(nvram_file, type_str);
+            if (ret != 0) {
+                return 1;
+            }
+        }
     } else {
         /* delete cid file if no specific type */
         ALOGD("Deleting file %s\n", CID_PATH);
         remove(CID_PATH);
     }
-    fclose(file);
     return 0;
 }
